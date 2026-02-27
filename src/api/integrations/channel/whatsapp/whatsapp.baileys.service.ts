@@ -425,42 +425,83 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
-      if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
-      } else {
-        this.sendDataWebhook(Events.STATUS_INSTANCE, {
-          instance: this.instance.name,
-          status: 'closed',
-          disconnectionAt: new Date(),
-          disconnectionReasonCode: statusCode,
-          disconnectionObject: JSON.stringify(lastDisconnect),
-        });
 
-        await this.prismaRepository.instance.update({
-          where: { id: this.instanceId },
-          data: {
-            connectionStatus: 'close',
+      // v2.3.7a — Reconnection logic with explicit handling per disconnect reason
+      switch (statusCode) {
+        case DisconnectReason.restartRequired: // 515 — stream restart (normal after sync)
+          this.logger.info('Stream restart required (515) — reconnecting in 2s');
+          await delay(2000);
+          await this.connectToWhatsapp(this.phoneNumber);
+          break;
+
+        case DisconnectReason.connectionReplaced: // 440 — another device took over
+          this.logger.warn('Connection replaced by another device (440) — not reconnecting');
+          this.sendDataWebhook(Events.STATUS_INSTANCE, {
+            instance: this.instance.name,
+            status: 'closed',
             disconnectionAt: new Date(),
             disconnectionReasonCode: statusCode,
             disconnectionObject: JSON.stringify(lastDisconnect),
-          },
-        });
+          });
+          await this.prismaRepository.instance.update({
+            where: { id: this.instanceId },
+            data: {
+              connectionStatus: 'close',
+              disconnectionAt: new Date(),
+              disconnectionReasonCode: statusCode,
+              disconnectionObject: JSON.stringify(lastDisconnect),
+            },
+          });
+          this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+          this.client?.ws?.close();
+          this.client.end(new Error('Connection replaced'));
+          this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+          break;
 
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.STATUS_INSTANCE,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            { instance: this.instance.name, status: 'closed' },
-          );
-        }
+        case DisconnectReason.loggedOut:  // 401
+        case DisconnectReason.forbidden:  // 403
+        case 402:
+        case 406:
+          // Non-recoverable — clear session and do NOT reconnect
+          this.logger.warn(`Session terminated (${statusCode}) — clearing session, not reconnecting`);
+          this.sendDataWebhook(Events.STATUS_INSTANCE, {
+            instance: this.instance.name,
+            status: 'closed',
+            disconnectionAt: new Date(),
+            disconnectionReasonCode: statusCode,
+            disconnectionObject: JSON.stringify(lastDisconnect),
+          });
 
-        this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
-        this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
+          await this.prismaRepository.instance.update({
+            where: { id: this.instanceId },
+            data: {
+              connectionStatus: 'close',
+              disconnectionAt: new Date(),
+              disconnectionReasonCode: statusCode,
+              disconnectionObject: JSON.stringify(lastDisconnect),
+            },
+          });
 
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+            this.chatwootService.eventWhatsapp(
+              Events.STATUS_INSTANCE,
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              { instance: this.instance.name, status: 'closed' },
+            );
+          }
+
+          this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+          this.client?.ws?.close();
+          this.client.end(new Error('Close connection'));
+
+          this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+          break;
+
+        default:
+          // All other errors — reconnect immediately (existing behavior)
+          this.logger.info(`Connection closed (${statusCode}) — reconnecting`);
+          await this.connectToWhatsapp(this.phoneNumber);
+          break;
       }
     }
 
@@ -818,8 +859,18 @@ export class BaileysStartupService extends ChannelStartupService {
         if (contactsRaw.length > 0) {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+            try {
+              await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
+            } catch (error) {
+              // v2.3.7a — P2003: instance deleted during sync, skip safely
+              if (error?.code === 'P2003') {
+                this.logger.warn(`contacts.upsert createMany skipped: instance ${this.instanceId} FK violated (P2003)`);
+              } else {
+                throw error;
+              }
+            }
+          }
 
           const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
           if (usersContacts) {
@@ -916,10 +967,17 @@ export class BaileysStartupService extends ChannelStartupService {
             update: contact,
           }),
         );
-        await this.prismaRepository.$transaction(updateTransactions);
+        try {
+          await this.prismaRepository.$transaction(updateTransactions);
+        } catch (error) {
+          // v2.3.7a — P2003: instance deleted during sync, skip safely
+          if (error?.code === 'P2003') {
+            this.logger.warn(`contacts.update skipped: instance ${this.instanceId} FK violated (P2003)`);
+          } else {
+            throw error;
+          }
+        }
       }
-
-      //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
     },
   };
 
@@ -992,7 +1050,15 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
+          try {
+            await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
+          } catch (error) {
+            if (error?.code === 'P2003') {
+              this.logger.warn(`history chat.createMany skipped: instance ${this.instanceId} FK violated (P2003)`);
+            } else {
+              throw error;
+            }
+          }
         }
 
         const messagesRaw: any[] = [];
@@ -1052,7 +1118,15 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          try {
+            await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          } catch (error) {
+            if (error?.code === 'P2003') {
+              this.logger.warn(`history message.createMany skipped: instance ${this.instanceId} FK violated (P2003)`);
+            } else {
+              throw error;
+            }
+          }
         }
 
         if (
@@ -1150,16 +1224,24 @@ export class BaileysStartupService extends ChannelStartupService {
                   status: 'EDITED',
                 },
               });
-              await this.prismaRepository.messageUpdate.create({
-                data: {
-                  fromMe: editedMessage.key.fromMe,
-                  keyId: editedMessage.key.id,
-                  remoteJid: editedMessage.key.remoteJid,
-                  status: 'EDITED',
-                  instanceId: this.instanceId,
-                  messageId: (oldMessage as any).id,
-                },
-              });
+              try {
+                await this.prismaRepository.messageUpdate.create({
+                  data: {
+                    fromMe: editedMessage.key.fromMe,
+                    keyId: editedMessage.key.id,
+                    remoteJid: editedMessage.key.remoteJid,
+                    status: 'EDITED',
+                    instanceId: this.instanceId,
+                    messageId: (oldMessage as any).id,
+                  },
+                });
+              } catch (error) {
+                if (error?.code === 'P2003') {
+                  this.logger.warn(`messageUpdate.create (edit) skipped: FK violated (P2003)`);
+                } else {
+                  throw error;
+                }
+              }
             }
           }
 
@@ -1531,24 +1613,42 @@ export class BaileysStartupService extends ChannelStartupService {
               );
             }
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-              await this.prismaRepository.contact.upsert({
-                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-                create: contactRaw,
-                update: contactRaw,
-              });
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+              try {
+                await this.prismaRepository.contact.upsert({
+                  where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
+                  create: contactRaw,
+                  update: contactRaw,
+                });
+              } catch (error) {
+                if (error?.code === 'P2003') {
+                  this.logger.warn(`messages.upsert contact update skipped: FK violated (P2003)`);
+                } else {
+                  throw error;
+                }
+              }
+            }
 
             continue;
           }
 
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.upsert({
-              where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-              update: contactRaw,
-              create: contactRaw,
-            });
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+            try {
+              await this.prismaRepository.contact.upsert({
+                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
+                update: contactRaw,
+                create: contactRaw,
+              });
+            } catch (error) {
+              if (error?.code === 'P2003') {
+                this.logger.warn(`messages.upsert contact create skipped: FK violated (P2003)`);
+              } else {
+                throw error;
+              }
+            }
+          }
         }
       } catch (error) {
         this.logger.error(error);
@@ -1655,8 +1755,17 @@ export class BaileysStartupService extends ChannelStartupService {
           if (update.message === null && update.status === undefined) {
             this.sendDataWebhook(Events.MESSAGES_DELETE, { ...key, status: 'DELETED' });
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
-              await this.prismaRepository.messageUpdate.create({ data: message });
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+              try {
+                await this.prismaRepository.messageUpdate.create({ data: message });
+              } catch (error) {
+                if (error?.code === 'P2003') {
+                  this.logger.warn(`messageUpdate.create (delete) skipped: FK violated (P2003)`);
+                } else {
+                  throw error;
+                }
+              }
+            }
 
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
               this.chatwootService.eventWhatsapp(
@@ -1704,7 +1813,15 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { message: _msg, ...messageData } = message;
-            await this.prismaRepository.messageUpdate.create({ data: messageData });
+            try {
+              await this.prismaRepository.messageUpdate.create({ data: messageData });
+            } catch (error) {
+              if (error?.code === 'P2003') {
+                this.logger.warn(`messageUpdate.create (status) skipped: FK violated (P2003)`);
+              } else {
+                throw error;
+              }
+            }
           }
 
           const existingChat = await this.prismaRepository.chat.findFirst({
@@ -1835,11 +1952,19 @@ export class BaileysStartupService extends ChannelStartupService {
             predefinedId: label.predefinedId,
             instanceId: this.instanceId,
           };
-          await this.prismaRepository.label.upsert({
-            where: { labelId_instanceId: { instanceId: labelData.instanceId, labelId: labelData.labelId } },
-            update: labelData,
-            create: labelData,
-          });
+          try {
+            await this.prismaRepository.label.upsert({
+              where: { labelId_instanceId: { instanceId: labelData.instanceId, labelId: labelData.labelId } },
+              update: labelData,
+              create: labelData,
+            });
+          } catch (error) {
+            if (error?.code === 'P2003') {
+              this.logger.warn(`label.upsert skipped: instance ${this.instanceId} FK violated (P2003)`);
+            } else {
+              throw error;
+            }
+          }
         }
       }
     },
