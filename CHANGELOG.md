@@ -1,3 +1,37 @@
+# 2.3.7a (2026-02-27) — LimpVix Fork
+
+### Bug Fixes — Estabilidade Baileys
+
+* **P2003 Foreign Key Protection**: Envolveu 11 operações Prisma em try-catch
+  para capturar `P2003` (Foreign key constraint violated) quando uma instância
+  é deletada durante sync de contatos/mensagens/chats/labels. Em vez de crashar,
+  o erro é logado como warning e a operação é ignorada.
+  - `contacts.upsert createMany`
+  - `contacts.update transaction`
+  - `chat.createMany` (history sync)
+  - `message.createMany` (history sync)
+  - `messageUpdate.create` (edit/delete/status — 3 locais)
+  - `contact.upsert` (messages.upsert — update + create)
+  - `label.upsert`
+
+* **Reconnection Logic (switch/case)**: Substituiu lógica genérica por
+  tratamento explícito por código de desconexão:
+  - `515` (restartRequired): reconecta em 2s — normal após sync
+  - `440` (connectionReplaced): não reconecta, emite logout + webhook
+  - `401` (loggedOut), `403` (forbidden), `402`, `406`: sessão terminada,
+    limpa estado e não reconecta
+  - Default: reconecta imediatamente (mantém comportamento original)
+
+### Infrastructure
+
+* **Prisma Cascade**: Todas 37 relações `instanceId` em `postgresql-schema.prisma`
+  configuradas com `onDelete: Cascade` para limpeza automática ao deletar instância
+* **Version**: `package.json` atualizado para `2.3.7a`
+* **Docker**: Build local com bind-mount de `src/`, `dist/`, `prisma/`
+* **Removed**: `CONFIG_SESSION_PHONE_VERSION` — usa auto-detect do Baileys
+
+---
+
 # 2.3.7 (2025-12-05)
 
 ### Features
